@@ -1,5 +1,18 @@
 package edu.buffalo.cse.cse486586.simpledynamo;
 
+import android.content.ContentProvider;
+import android.content.ContentValues;
+import android.content.Context;
+import android.database.Cursor;
+import android.database.MatrixCursor;
+import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteOpenHelper;
+import android.net.Uri;
+import android.os.AsyncTask;
+import android.os.ConditionVariable;
+import android.telephony.TelephonyManager;
+import android.util.Log;
+
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
@@ -15,18 +28,6 @@ import java.util.Formatter;
 import java.util.HashMap;
 import java.util.Map;
 
-import android.content.ContentProvider;
-import android.content.ContentValues;
-import android.content.Context;
-import android.database.Cursor;
-import android.database.MatrixCursor;
-import android.database.sqlite.SQLiteDatabase;
-import android.database.sqlite.SQLiteOpenHelper;
-import android.net.Uri;
-import android.os.AsyncTask;
-import android.telephony.TelephonyManager;
-import android.util.Log;
-
 public class SimpleDynamoProvider extends ContentProvider {
 	private static boolean isFirstLaunch = false;
 	static String[] REMOTE_PORT ={"11124","11112","11108","11116","11120"};
@@ -38,6 +39,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 	private static final String TABLE_NAME = "dynamoTable";
 	private static final String KEY_FIELD = "key",VALUE_FIELD="value";
 	static final int SERVER_PORT = 10000;
+	ConditionVariable recover = new ConditionVariable(true);
 	private static final String SQL_CREATE_MAIN = "CREATE TABLE " +
 		    TABLE_NAME +                       // Table's name
 		    " (" +                           // The columns in the table
@@ -58,7 +60,7 @@ public class SimpleDynamoProvider extends ContentProvider {
     		for (int i =0; i<REMOTE_PORT.length;i++){
 				if(REMOTE_PORT[i].equals(MY_PORT)){
 					//skip the current node
-					Log.e("queryAll", "skip loop");
+					Log.d("queryAll", "skip loop");
 					continue;
 				}
 			Message message = new Message("deleteAll",REMOTE_PORT[i]);
@@ -148,7 +150,18 @@ public class SimpleDynamoProvider extends ContentProvider {
 			ContentValues value = new ContentValues();
 			value.put(KEY_FIELD, message.getKey());
 			value.put(VALUE_FIELD, message.getValue());
-			messageTable.insert(TABLE_NAME, null, value);
+			Cursor c=messageTable.rawQuery("SELECT * FROM "+TABLE_NAME+" WHERE "+KEY_FIELD+"='"+message.getKey()+"'", null);
+			c.moveToFirst();
+			if(c.getCount()==0){
+				messageTable.insert(TABLE_NAME, null, value);
+			}else{
+				String[] temp=(c.getString(1)).split("##");
+				if(temp[1].compareTo(value.getAsString(VALUE_FIELD).split("##")[1])<0){
+					//insert only if latest copy 
+					messageTable.delete(TABLE_NAME, KEY_FIELD+" ='"+value.getAsString(KEY_FIELD)+"'", null);
+					messageTable.insert(TABLE_NAME,null,value);
+				}
+			}
 			Log.d("sendInsert", "successfully inserted "+message.getKey()+" at "+position);
 		}
 		else{
@@ -172,6 +185,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 	public boolean onCreate() {
 		Log.d("onCreate","entered");
 		mOpenHelper = new DatabaseHelper(getContext(),TABLE_NAME+".db");
+		messageTable = mOpenHelper.getWritableDatabase();
 		TelephonyManager tel = (TelephonyManager) this.getContext().getSystemService(Context.TELEPHONY_SERVICE);
         String portStr = tel.getLine1Number().substring(tel.getLine1Number().length() - 4);
         MY_PORT = String.valueOf((Integer.parseInt(portStr) * 2));
@@ -184,7 +198,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 			}
 			position++;
 		}
-		
         ServerSocket serverSocket=null;
 		try {
 			serverSocket = new ServerSocket(SERVER_PORT);
@@ -193,6 +206,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 			e.printStackTrace();
 		}
 		Log.d("onCreate","exiting");
+		if(!isFirstLaunch){
+			new RecoveryTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, (Void[])null);
+		}
 		new ServerTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, serverSocket);
 		return false;
 	}
@@ -212,7 +228,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		socket.close();
 		return hashmap;
 	}
-	private HashMap<String, String> recover(int currPosition)throws SocketTimeoutException, StreamCorruptedException{
+	private HashMap<String, String> recover(int currPosition){
 		HashMap<String, String> hashMap = null;
 		Message recoveryMessage = new Message("recovery", REMOTE_PORT[currPosition]);
 			try {
@@ -243,10 +259,19 @@ public class SimpleDynamoProvider extends ContentProvider {
 					messageTable.insert(TABLE_NAME, null, cV);
 				}else if((c.getString(1).split("##"))[1].compareTo(tempTuple[1])<0){
 					//insert only if it is the latest copy
+					messageTable.delete(TABLE_NAME, KEY_FIELD+" ='"+cV.getAsString(KEY_FIELD)+"'", null);
 					messageTable.insert(TABLE_NAME, null, cV);
 				}
 			}
 		}
+		/*Cursor c = messageTable.rawQuery("SELECT * FROM "+TABLE_NAME, null);
+		c.moveToFirst();
+		while(!c.isAfterLast()){
+			if(!hashMap.containsKey(c.getString(0))){
+				messageTable.delete(TABLE_NAME, KEY_FIELD+" ='"+c.getString(0)+"'", null);
+			}
+			c.moveToNext();
+		}*/
 		if(hashMap.size()==0){
 			messageTable.delete(TABLE_NAME, null, null);
 		}
@@ -331,58 +356,67 @@ public class SimpleDynamoProvider extends ContentProvider {
 				i++;	
 			}
 			i=i%5;
-			if(REMOTE_PORT[i].equalsIgnoreCase(MY_PORT)){
-				cursor = messageTable.rawQuery("SELECT * FROM "+TABLE_NAME+" WHERE "+KEY_FIELD+" = '"+selection+"'", null);
-				cursor.moveToFirst();
-				while(!cursor.isAfterLast()){
-					//load it into the cursor
-					hashmap.put(cursor.getString(0),(cursor.getString(1).split("##"))[0]);
-					cursor.moveToNext();
-				}
-			}else{
-				try {
-						Log.d("query", "query for key "+selection+ " found at "+i);
-						Message message = new Message("query", REMOTE_PORT[i]);
-						message.setKey(selection);
-						hashmap = sendMessage(message.getDestination_Port(), message);
-				} catch ( SocketTimeoutException | StreamCorruptedException e){
-					Log.wtf("timeout", REMOTE_PORT[i]+" has timed out in query");
-					//try the next node 
-						i=(i+1)%5;
-						try {
-							Message message = new Message("query", REMOTE_PORT[i]);
-							message.setKey(selection);
-							hashmap =sendMessage(message.getDestination_Port(), message);
-						}catch(SocketTimeoutException | StreamCorruptedException ste){
-							Log.wtf("timeout", REMOTE_PORT[i]+" has timed out in query");
-							//try the next node 
-								i=(i+1)%5;
-								try {
-									Message message = new Message("query", REMOTE_PORT[i]);
-									message.setKey(selection);
-									hashmap =sendMessage(message.getDestination_Port(), message);
-								} catch(SocketTimeoutException ste1){
-									Log.wtf("timeout", REMOTE_PORT[i]+" has timed out in query again!");
-								}
-								catch (NumberFormatException | IOException | ClassNotFoundException e1) {
-									e1.printStackTrace();
-								}
-						}
-						catch (NumberFormatException | IOException | ClassNotFoundException e1) {
-							e1.printStackTrace();
-						}
-				}catch (NumberFormatException  | ClassNotFoundException | IOException e) {
-					e.printStackTrace();
+			HashMap<String,String> tempHashMap = null;
+			Message tempMessage = new Message();
+			tempMessage.setKey(selection);
+			Message message = new Message("query", REMOTE_PORT[i]);
+			message.setKey(selection);
+			tempHashMap = sendQuery(message);
+			if(tempHashMap!=null&&tempHashMap.get(message.getKey())!=null){
+				tempMessage.setValue(tempHashMap.get(selection));
+			}
+			message = new Message("query", REMOTE_PORT[(i+1)%5]);
+			message.setKey(selection);
+			tempHashMap = sendQuery(message);
+			if(tempHashMap!=null&&tempHashMap.get(selection)!=null){
+				if(tempMessage.getValue()==null){
+					tempMessage.setValue(tempHashMap.get(selection));
+				}else if(tempMessage.getValue().split("##")[1].compareTo(tempHashMap.get(selection).split("##")[1])<0){
+					tempMessage.setValue(tempHashMap.get(selection));
 				}
 			}
-		}
+			message = new Message("query", REMOTE_PORT[(i+2)%5]);
+			message.setKey(selection);
+			tempHashMap = sendQuery(message);
+			if(tempHashMap!=null&&tempHashMap.get(selection)!=null){
+				if(tempMessage.getValue()==null){
+					tempMessage.setValue(tempHashMap.get(selection));
+				}else if(tempMessage.getValue().split("##")[1].compareTo(tempHashMap.get(selection).split("##")[1])<0){
+					tempMessage.setValue(tempHashMap.get(selection));
+				}
+			}
+			hashmap.put(tempMessage.getKey(),tempMessage.getValue().split("##")[0]);
+			}
+		
 		//convert the hashmap to cursor so that it can be returned
 		for(Map.Entry<String,String> entry : hashmap.entrySet()){
 			matrixCursor.addRow(new String[]{entry.getKey(),entry.getValue()});
 			Log.d("query", "the received key: "+entry.getKey()+" value: "+entry.getValue());
 		}
+		Log.d("query", "no of rows are: "+matrixCursor.getCount());
 		matrixCursor.moveToFirst();
 		return matrixCursor;
+	}
+	public HashMap<String,String> sendQuery(Message message){
+		HashMap<String,String> hashMap = null;
+		Cursor cursor = null;
+		if(message.getDestination_Port().equalsIgnoreCase(MY_PORT)){
+			hashMap = new HashMap<String,String>();
+			cursor = messageTable.rawQuery("SELECT * FROM "+TABLE_NAME+" WHERE "+KEY_FIELD+" = '"+message.getKey()+"'", null);
+			cursor.moveToFirst();
+			Log.d("query", "cursor size is "+cursor.getCount());
+			hashMap.put(cursor.getString(0), cursor.getString(1));
+		}else{
+			try {
+				hashMap = sendMessage(message.getDestination_Port(), message);
+			} catch(SocketTimeoutException|StreamCorruptedException ste){}
+			catch (NumberFormatException
+					| ClassCastException
+					| ClassNotFoundException | IOException e) {
+				e.printStackTrace();
+			}
+		}
+		return hashMap;
 	}
 
 	@Override
@@ -427,8 +461,48 @@ public class SimpleDynamoProvider extends ContentProvider {
 		public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
 		}
 	}
+    private class RecoveryTask extends AsyncTask<Void, Void, Void>{
+		@Override
+		
+		protected Void doInBackground(Void... params) {
+			if(!isFirstLaunch){
+				long startTime = System.nanoTime();
+				recover.close();
+				HashMap<String, String> hashMap= null;
+				Log.d("onCreate","not the first launch");
+				hashMap = null;
+				hashMap = recover((position+4)%5);
+				if(hashMap!=null){
+					populateDB(hashMap);
+				}
+				hashMap = null;
+				hashMap = recover((position+3)%5);
+				if(hashMap!=null){
+					populateDB(hashMap);
+				}
+				hashMap = null;
+				hashMap = recover((position+1)%5);
+				if(hashMap!=null){
+					populateDB(hashMap);
+				}
+				hashMap = null;
+				hashMap = recover((position+2)%5);
+				if(hashMap!=null){
+					populateDB(hashMap);
+				}
+				long endTime = System.nanoTime();
+				Log.wtf("recover","time required for recovery "+(endTime-startTime)/1000000);
+				recover.open();
+			}
+			else{
+				Log.d("onCreate","first launch");
+			}
+			return null;
+		}
+    	
+    }
     private class ServerTask extends AsyncTask<ServerSocket, String, Void>{
-
+    	 
 		@Override
 		protected Void doInBackground(ServerSocket... sockets) {
 			ServerSocket serverSocket = sockets[0];
@@ -437,31 +511,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 			ObjectInputStream input =null;
 			ObjectOutputStream out = null;
 			messageTable = mOpenHelper.getWritableDatabase();
-			if(!isFirstLaunch){
-				HashMap<String, String> hashMap= null;
-				Log.d("onCreate","not the first launch");
-				try{
-					hashMap = recover((position+4)%5);
-				}catch(SocketTimeoutException | StreamCorruptedException ste ){
-					
-						try {
-							hashMap = recover((position+3)%5);
-						} catch (SocketTimeoutException | StreamCorruptedException e) {}
-				}
-				populateDB(hashMap);
-				hashMap = null;
-				try{
-					hashMap = recover((position+1)%5);
-				}catch(SocketTimeoutException | StreamCorruptedException ste){
-					try {
-						hashMap = recover((position+2)%5);
-					} catch (SocketTimeoutException | StreamCorruptedException e) {}
-				}
-				populateDB(hashMap);
-			}
-			else{
-				Log.d("onCreate","first launch");
-			}
+			
 			while(true){
 				Log.d("ServerTask","in ServerTask");
 				synchronized(this){
@@ -488,23 +538,25 @@ public class SimpleDynamoProvider extends ContentProvider {
 							messageTable.insert(TABLE_NAME,null,cV);
 						}else{
 							temp=(c.getString(1)).split("##");
-							if(temp[1].compareToIgnoreCase(c.getString(1).split("##")[1])>0){
-								//insert only if latest copy 
+							if(temp[1].compareToIgnoreCase(inputString.getValue().split("##")[1])<0){
+								//insert only if latest copy and remove old copy
+								messageTable.delete(TABLE_NAME, KEY_FIELD+" ='"+cV.getAsString(KEY_FIELD)+"'", null);
 								messageTable.insert(TABLE_NAME,null,cV);
 							}
 						}
 						
 					}else if(inputString.getType().equalsIgnoreCase("query")){
 						//TODO: query
+						recover.block();
 						Log.d("server", "query for "+inputString.getKey());
 						Cursor  cursor = messageTable.rawQuery("SELECT * FROM "+TABLE_NAME+" WHERE "+KEY_FIELD+" = '"+inputString.getKey()+"'",null);
 						try {
 							HashMap<String,String> hashmap = new HashMap<String,String>();
 							out = new ObjectOutputStream(socket.getOutputStream());
 							cursor.moveToFirst();
-							Log.wtf("server", "key: "+inputString.getKey()+" found cursor size = "+cursor.getCount());
+							Log.d("server", "key: "+inputString.getKey()+" found cursor size = "+cursor.getCount());
 							while(!cursor.isAfterLast()){
-								hashmap.put(cursor.getString(0),(cursor.getString(1).split("##"))[0]);
+								hashmap.put(cursor.getString(0),cursor.getString(1));
 								cursor.moveToNext();
 							}
 							out.writeObject(hashmap);
@@ -516,6 +568,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 					}else if(inputString.getType().equalsIgnoreCase("queryAll")||
 							inputString.getType().equalsIgnoreCase("recovery")){
 						try{
+							recover.block();
 							Cursor cursor =messageTable.rawQuery("SELECT * FROM "+TABLE_NAME, null);
 							HashMap<String,String> hashmap = new HashMap<>();
 							out = new ObjectOutputStream(socket.getOutputStream());
