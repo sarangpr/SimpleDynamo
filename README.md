@@ -10,4 +10,4 @@ The key features implemented:
 3) Replication: The key-value pairs are replicated to provide availablity in case of Node faliures.
 4) Object Versioning: To provide consistency object versioning was implemented to avoid any conflicts.
 5) Faliure Handling: In case of node failure, the request is redirected to the replica of the appropriate node. 
-6) Node recovery: After a node failure, when the node recovers it requests the missed insertions from it's neighn=bouring nodes. 
+6) Node recovery: After a node failure, when the node recovers it requests the missed insertions from it's neighboring nodes. 
